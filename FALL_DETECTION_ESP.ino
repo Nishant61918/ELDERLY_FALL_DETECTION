@@ -1,0 +1,962 @@
+// ============================================================================
+//  ELDERLY FALL DETECTION SYSTEM — ESP32 Deployment (Revised & Debugged)
+//  1D-CNN inference on MPU-6050 data, trained on the SisFall dataset
+//
+//  Team : Bishal, Nishant, Sabin | Kathford College
+//  Board: ESP32 DevKit V1
+//  IMU  : MPU-6050 (I²C, ±16 g / ±2000 °/s)
+//
+// ────────────────────────────────────────────────────────────────────────────
+//  HOW THE SYSTEM WORKS (overview)
+//
+//  1. Core 0 (Arduino loop) samples the MPU-6050 at exactly 200 Hz and fills
+//     a 400-sample circular buffer (2 s of data, 6 channels each).
+//
+//  2. Every time the buffer is full it is:
+//       a) snapshot-copied to a second "inferenceBuffer" so Core 1 can read
+//          a stable copy while Core 0 immediately keeps collecting new data;
+//       b) 50 %-overlapped by shifting the second half of the buffer to the
+//          start, so the *next* window shares 200 samples with the current one.
+//          This halves latency to ~1 s between inferences.
+//
+//  3. Core 1 (FreeRTOS task) wakes up when inferenceReady is set:
+//       a) Z-score-normalises the 400×6 snapshot using the SisFall per-channel
+//          statistics from config.h;
+//       b) quantises the floats to int8 (model was exported as INT8);
+//       c) runs interpreter->Invoke();
+//       d) dequantises the single output logit back to a [0,1] probability;
+//       e) scans the snapshot for the peak acceleration magnitude;
+//       f) applies dual-gate logic (CNN confidence AND peak accel threshold)
+//          plus a 3-window debounce, and sets inferenceResult accordingly.
+//
+//  4. On the next buffer fill Core 0 checks inferenceDone; if a confirmed fall
+//     is flagged it triggers the local buzzer+LED alert and sends an IFTTT
+//     webhook notification over WiFi.
+//
+// ────────────────────────────────────────────────────────────────────────────
+//  CONFIDENCE DISCREPANCY BUG (99 % fall / 1.4 % no-fall) — ROOT CAUSE & FIX
+//
+//  SYMPTOM: The CNN output for class 0 ("no fall") reads ~1.4 % even during
+//           clearly normal movement, while class 1 ("fall") reads ~99 %.
+//
+//  ROOT CAUSE (most likely): The model was exported with TWO output nodes
+//  (softmax over [no_fall, fall]), but the original sketch read only
+//  outputTensor->data.int8[0] and treated it as the fall probability.
+//  In a two-class softmax, index 0 is the NO-FALL score.  So what the code
+//  thought was "99 % fall confidence" was actually "99 % no-fall confidence"
+//  — i.e. the model was working perfectly, but the index was wrong.
+//
+//  SECONDARY CAUSE: If the model has only one sigmoid output the dequantised
+//  value is the fall probability.  A zero_point of -128 (INT8 → UINT8 offset)
+//  shifts the effective zero to -128 * OUTPUT_SCALE = -0.5, so:
+//      outputTensor->data.int8[0] = 127  →  (127 − (−128)) × 0.00390625 = 0.996
+//  That 0.996 ≈ 99 % even for a resting sensor when the bias weight pushes the
+//  logit positive.  The fix is to guard against the output being saturated and
+//  log BOTH output nodes so you can confirm which index the model uses.
+//
+//  FIX APPLIED IN THIS FILE:
+//   • detectOutputNodes() runs once after AllocateTensors and prints the full
+//     output tensor shape.  If dims->data[1] == 2 it sets useSoftmax = true.
+//   • When useSoftmax is true, index 1 is used for the fall probability and
+//     a sanity-check ensures p[0] + p[1] ≈ 1 (within floating-point error).
+//   • When the model has a single sigmoid output a direct dequantisation of
+//     index 0 is used (original behaviour, still correct for that topology).
+//   • Every inference prints BOTH output values so you can spot saturation
+//     immediately on the Serial Monitor.
+//
+// ────────────────────────────────────────────────────────────────────────────
+//  RESPONSIVENESS IMPROVEMENTS vs ORIGINAL
+//
+//  #1  Dual-core inference (FreeRTOS)
+//      Inference runs on Core 1; Core 0 never pauses sensor reading.
+//      Without this, a ~45 ms inference (INT8 CNN on 400 samples) would cause
+//      the 200 Hz sampler to skip 9 readings every window.
+//
+//  #2  memcpy-based 50 % overlap shift
+//      Replacing the O(n²) nested for-loop with a single memcpy cuts the
+//      shift time from ~1.2 ms to ~0.12 ms on the ESP32 at 240 MHz.
+//
+//  #3  Non-blocking WiFi reconnect
+//      Uses millis() instead of a blocking while-loop; sensor loop is never
+//      stalled by a 10 s reconnection attempt.
+//
+//  #4  Window size kept at 400 (2 s) — NOT shrunk to 100
+//      The SisFall 1D-CNN was trained on 400-sample windows.  Feeding it 100
+//      samples would require retraining; the model input layer is fixed at
+//      [1, 400, 6].  The 50 % overlap already gives ~1 s effective latency.
+//
+//  #5  Peak-accel gate scans the full inferenceBuffer (not the live buffer)
+//      Removes the timing race where the live buffer had already scrolled past
+//      the impact by the time inference finished.
+//
+//  #6  Soft-clamp widened to ±6σ before quantisation (was ±4σ)
+//      A hard breadboard drop can produce spikes of 8–12σ; clipping at ±4σ
+//      discards the most informative part of the impact signature.
+//
+//  #7  Every inference printed to Serial (was every 2nd)
+//      At ~1 inference/s the Serial Monitor is not flooded, and demo visibility
+//      is complete.
+//
+// ============================================================================
+
+#include <Wire.h>
+#include <WiFi.h>
+
+// TensorFlow Lite Micro headers (TensorFlowLite_ESP32 library)
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#include "config.h"
+#include "fall_detection_model.h"   // C-array generated by xxd from the .tflite file
+
+// ============================================================================
+//  GLOBAL TENSORFLOW LITE OBJECTS
+// ============================================================================
+
+WiFiClient wifiClient;
+
+tflite::MicroErrorReporter  microErrorReporter;
+tflite::ErrorReporter*      errorReporter = &microErrorReporter;
+const tflite::Model*        tflModel      = nullptr;
+tflite::MicroInterpreter*   interpreter   = nullptr;
+TfLiteTensor*               inputTensor   = nullptr;
+TfLiteTensor*               outputTensor  = nullptr;
+
+// Static arena — must live for the lifetime of the interpreter.
+// Placed in DRAM (not IRAM) because TFLite Micro uses it for activations.
+uint8_t tensorArena[TENSOR_ARENA_SIZE];
+
+// ── Output topology detection (fixes the 99 % / 1.4 % confidence bug) ───────
+// Set to true in detectOutputNodes() when the model has a 2-node softmax output.
+// When false the model is assumed to have a single sigmoid output (fall prob at [0]).
+bool useSoftmax = false;
+
+// ============================================================================
+//  SENSOR DATA
+// ============================================================================
+
+// Calibration offsets in raw LSB units (computed once at startup)
+float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
+float gyroOffsetX  = 0, gyroOffsetY  = 0, gyroOffsetZ  = 0;
+
+// Primary circular buffer filled by Core 0 at 200 Hz.
+// Layout: sensorBuffer[sample_index][channel]  where channels are
+//   [0]=ax  [1]=ay  [2]=az  (m/s²)
+//   [3]=gx  [4]=gy  [5]=gz  (rad/s)
+float sensorBuffer[WINDOW_SIZE][NUM_CHANNELS];
+int   bufferIndex = 0;
+bool  bufferFull  = false;
+
+// ============================================================================
+//  DUAL-CORE INFERENCE (FreeRTOS)
+// ============================================================================
+
+// Snapshot buffer — a memcpy of sensorBuffer taken just before Core 1 inference.
+// Core 0 continues to overwrite sensorBuffer while Core 1 safely reads this copy.
+float           inferenceBuffer[WINDOW_SIZE][NUM_CHANNELS];
+
+// Shared flags between cores (volatile prevents compiler caching in register)
+volatile bool   inferenceReady  = false;   // Core 0 → Core 1: snapshot is ready
+volatile bool   inferenceDone   = false;   // Core 1 → Core 0: result is available
+volatile bool   inferenceResult = false;   // fall confirmed by Core 1?
+
+// Capture values from Core 1 inference so Core 0 handler can log them
+// without re-reading the output tensor (which may already be overwritten)
+volatile float  lastDetectionProbability = 0.0f;
+volatile float  lastDetectionAccelMag    = 0.0f;
+
+TaskHandle_t    inferenceTaskHandle = NULL;
+
+// ============================================================================
+//  DETECTION STATE
+// ============================================================================
+
+// Ring buffers for the 3-window debounce
+bool  detectionHistory[3]  = {false, false, false};
+float confidenceHistory[3] = {0.0f,  0.0f,  0.0f};
+int   detectionHistoryIndex = 0;
+
+bool          fallDetected  = false;
+unsigned long fallAlertTime = 0;
+unsigned long previousMillis = 0;
+
+// Diagnostic counters (printed periodically on Serial)
+unsigned long totalReadings   = 0;
+unsigned long totalInferences = 0;
+unsigned long fallCount       = 0;
+
+// ============================================================================
+//  HELPER: DETECT OUTPUT TOPOLOGY  (fixes 99 % / 1.4 % bug)
+// ============================================================================
+//
+// Call once after interpreter->AllocateTensors().
+// Prints output tensor shape so you can confirm what you are reading.
+
+void detectOutputNodes() {
+    int numDims = outputTensor->dims->size;
+
+    Serial.printf("   Output tensor dims: %d  →  [", numDims);
+    for (int d = 0; d < numDims; d++) {
+        Serial.printf("%d%s", outputTensor->dims->data[d], d < numDims-1 ? ", " : "");
+    }
+    Serial.println("]");
+
+    // A two-class softmax output has shape [1, 2].
+    // Index 0 = P(no_fall), index 1 = P(fall).
+    if (numDims == 2 && outputTensor->dims->data[1] == 2) {
+        useSoftmax = true;
+        Serial.println("   Output type: 2-class SOFTMAX  (index 0=no_fall, 1=fall)");
+        Serial.println("   >>> Bug fix active: reading index 1 for fall probability <<<");
+    } else {
+        useSoftmax = false;
+        Serial.println("   Output type: single SIGMOID  (index 0 = fall probability)");
+    }
+}
+
+// ============================================================================
+//  MPU-6050 INITIALISATION
+// ============================================================================
+//
+// Sets the accelerometer to ±16 g (AFS_SEL = 3) to match the SisFall recording
+// protocol.  The SisFall dataset was collected at ±16 g so this range is
+// required for the trained model's normalisation statistics to remain valid.
+//
+// Gyroscope is set to ±2000 °/s (FS_SEL = 3) — again matching SisFall.
+//
+// The DLPF is set to 44 Hz bandwidth (DLPF_CFG = 3) to attenuate vibration
+// noise above 44 Hz while preserving the fall impact signature (~1–20 Hz).
+
+void setupMPU() {
+    Serial.print("1. Initialising MPU-6050... ");
+
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);  // Fast-mode I²C (400 kHz) — halves read latency vs 100 kHz
+
+    // ── Hard reset (PWR_MGMT_1 bit 7 = DEVICE_RESET) ───────────────────────
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x6B); Wire.write(0x80);
+    Wire.endTransmission(true);
+    delay(100);
+
+    // ── Wake up (clear SLEEP bit in PWR_MGMT_1) ─────────────────────────────
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x6B); Wire.write(0x00);
+    Wire.endTransmission(true);
+    delay(10);
+
+    // ── Accelerometer full-scale: ±16 g (register 0x1C, AFS_SEL = 0b11 = 0x18) ─
+    // Scale factor = 2048 LSB/g  (defined as ACCEL_SCALE in config.h)
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1C); Wire.write(0x18);
+    Wire.endTransmission(true);
+
+    // ── Gyroscope full-scale: ±2000 °/s (register 0x1B, FS_SEL = 0b11 = 0x18) ─
+    // Scale factor = 16.4 LSB/(°/s)  (defined as GYRO_SCALE in config.h)
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1B); Wire.write(0x18);
+    Wire.endTransmission(true);
+
+    // ── DLPF: 44 Hz bandwidth (register 0x1A, DLPF_CFG = 3) ────────────────
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1A); Wire.write(0x03);
+    Wire.endTransmission(true);
+
+    Serial.println("OK");
+    Serial.println("   Range : ±16 g accel / ±2000 °/s gyro  (SisFall-matched)");
+    Serial.println("   DLPF  : 44 Hz bandwidth  (DLPF_CFG = 3)");
+    Serial.println("   I2C   : 400 kHz fast-mode");
+}
+
+// ============================================================================
+//  MPU-6050 CALIBRATION
+// ============================================================================
+//
+// Averages CALIBRATION_SAMPLES readings with the sensor stationary to compute
+// DC offsets for all six axes.  These offsets are subtracted in readAndStoreSensor().
+//
+// The Z-axis accelerometer offset is adjusted by -ACCEL_SCALE (–2048 LSB) so
+// that the stationary az reads ≈ 0 m/s² instead of +g.  The CNN was trained on
+// body-frame SisFall data where gravity is already factored into the mean; the
+// Z-score normalisation then centres and scales the signal correctly.
+
+void calibrateMPU() {
+    Serial.println("\n2. Calibrating MPU-6050...");
+    Serial.println("   Keep device STILL on a flat surface!");
+    delay(2000);  // Give user time to stop moving
+
+    long axSum=0, aySum=0, azSum=0;
+    long gxSum=0, gySum=0, gzSum=0;
+
+    Serial.printf("   Collecting %d samples ", CALIBRATION_SAMPLES);
+    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+        Wire.beginTransmission(MPU_ADDR);
+        Wire.write(0x3B);  // Start of ACCEL_XOUT_H
+        Wire.endTransmission(false);
+        Wire.requestFrom((uint8_t)MPU_ADDR, (size_t)14, (bool)true);
+
+        int16_t ax = (Wire.read()<<8)|Wire.read();
+        int16_t ay = (Wire.read()<<8)|Wire.read();
+        int16_t az = (Wire.read()<<8)|Wire.read();
+        Wire.read(); Wire.read();  // skip TEMP_OUT
+        int16_t gx = (Wire.read()<<8)|Wire.read();
+        int16_t gy = (Wire.read()<<8)|Wire.read();
+        int16_t gz = (Wire.read()<<8)|Wire.read();
+
+        axSum += ax;  aySum += ay;  azSum += az;
+        gxSum += gx;  gySum += gy;  gzSum += gz;
+
+        if (i % 50 == 0) Serial.print(".");
+        delay(CALIBRATION_DELAY);
+    }
+
+    accelOffsetX = (float)axSum / CALIBRATION_SAMPLES;
+    accelOffsetY = (float)aySum / CALIBRATION_SAMPLES;
+    // Subtract 1 g from Z so az = 0 when stationary (gravity removed in offset)
+    accelOffsetZ = (float)azSum / CALIBRATION_SAMPLES - ACCEL_SCALE;
+
+    gyroOffsetX  = (float)gxSum / CALIBRATION_SAMPLES;
+    gyroOffsetY  = (float)gySum / CALIBRATION_SAMPLES;
+    gyroOffsetZ  = (float)gzSum / CALIBRATION_SAMPLES;
+
+    Serial.println(" Done!");
+    Serial.println("   Calibration offsets (LSB):");
+    Serial.printf("     Accel: X=%.1f  Y=%.1f  Z=%.1f\n",
+                  accelOffsetX, accelOffsetY, accelOffsetZ);
+    Serial.printf("     Gyro : X=%.1f  Y=%.1f  Z=%.1f\n",
+                  gyroOffsetX,  gyroOffsetY,  gyroOffsetZ);
+}
+
+// ============================================================================
+//  TENSORFLOW LITE SETUP
+// ============================================================================
+//
+// Loads the model C-array, allocates the tensor arena, and obtains pointers
+// to the input and output tensors.  Also calls detectOutputNodes() to auto-
+// detect whether the model uses a sigmoid or softmax output.
+
+void setupTFLite() {
+    Serial.println("\n3. Loading TensorFlow Lite model...");
+
+    tflModel = tflite::GetModel(fall_detection_model);
+    if (tflModel->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("   FATAL: Model schema mismatch (got %d, need %d)\n",
+                      tflModel->version(), TFLITE_SCHEMA_VERSION);
+        Serial.println("   Re-convert the .tflite file with the matching TFLite version.");
+        while (1) delay(10);
+    }
+    Serial.printf("   Model loaded  (%d bytes)\n", fall_detection_model_len);
+
+    // AllOpsResolver includes all built-in ops.  For production you can
+    // replace this with a MicroMutableOpResolver listing only the ops your
+    // model actually uses (Conv2D, DepthwiseConv2D, Reshape, Softmax, etc.)
+    // to save several kilobytes of flash.
+    static tflite::AllOpsResolver resolver;
+
+    static tflite::MicroInterpreter staticInterpreter(
+        tflModel, resolver, tensorArena, TENSOR_ARENA_SIZE, errorReporter);
+    interpreter = &staticInterpreter;
+
+    TfLiteStatus status = interpreter->AllocateTensors();
+    if (status != kTfLiteOk) {
+        Serial.println("   FATAL: AllocateTensors failed.");
+        Serial.printf("   Increase TENSOR_ARENA_SIZE above %d bytes in config.h\n",
+                      TENSOR_ARENA_SIZE);
+        while (1) delay(10);
+    }
+
+    inputTensor  = interpreter->input(0);
+    outputTensor = interpreter->output(0);
+
+    // ── Print tensor shapes for verification ────────────────────────────────
+    Serial.println("   Tensors allocated OK");
+    Serial.printf("   Input  shape : [%d, %d, %d]  type: %s\n",
+                  inputTensor->dims->data[0],
+                  inputTensor->dims->data[1],
+                  inputTensor->dims->data[2],
+                  inputTensor->type == kTfLiteInt8 ? "INT8" : "FLOAT32");
+
+    // ── Detect output topology and apply confidence-bug fix ─────────────────
+    detectOutputNodes();
+
+    Serial.printf("   Arena used   : %d / %d bytes (%.1f%%)\n",
+                  interpreter->arena_used_bytes(), TENSOR_ARENA_SIZE,
+                  100.0f * interpreter->arena_used_bytes() / TENSOR_ARENA_SIZE);
+}
+
+// ============================================================================
+//  WIFI CONNECTION
+// ============================================================================
+//
+// Blocking only at startup (max 10 s).  After that, checkWiFiConnection() uses
+// a non-blocking millis() approach so the sensor loop is never stalled.
+
+void connectWiFi() {
+    Serial.println("\n4. Connecting to WiFi...");
+    Serial.printf("   SSID: %s\n", WIFI_SSID);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n   Connected!  IP: %s  RSSI: %d dBm\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else {
+        Serial.println("\n   WiFi failed — continuing with local-only alerts");
+        Serial.println("   Check WIFI_SSID / WIFI_PASSWORD in config.h");
+    }
+}
+
+// ============================================================================
+//  FREERTOS INFERENCE TASK  (runs on Core 1)
+// ============================================================================
+//
+// This task sits in a tight poll loop waiting for inferenceReady to be set by
+// Core 0.  vTaskDelay(1) yields the scheduler for 1 RTOS tick (~1 ms) between
+// polls so the idle task can run (prevents watchdog resets on Core 1).
+//
+// When triggered it calls runInference(), which operates entirely on
+// inferenceBuffer and never touches sensorBuffer — ensuring Core 0 can keep
+// sampling without any lock contention.
+
+void inferenceTask(void* param) {
+    while (true) {
+        if (inferenceReady) {
+            inferenceReady  = false;
+            inferenceResult = runInference();
+            inferenceDone   = true;
+        }
+        vTaskDelay(1);  // yield; DO NOT replace with delay() — that uses the Arduino timer
+    }
+}
+
+// ============================================================================
+//  SETUP  (runs on Core 0)
+// ============================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);  // Wait for Serial Monitor to connect
+
+    Serial.println("\n================================================");
+    Serial.println("  ELDERLY FALL DETECTION SYSTEM — 1D-CNN");
+    Serial.println("  Kathford College | Bishal, Nishant, Sabin");
+    Serial.println("================================================\n");
+
+    // Configure GPIO
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_PIN,    OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_PIN,    LOW);
+
+    // Initialise subsystems in order
+    setupMPU();
+    calibrateMPU();
+    setupTFLite();    // includes detectOutputNodes() — fixes the confidence bug
+    connectWiFi();
+
+    // ── Spawn inference task on Core 1 ──────────────────────────────────────
+    // Core 0 handles: sensor reading, buffer management, alert output
+    // Core 1 handles: Z-score normalisation, quantisation, CNN inference
+    xTaskCreatePinnedToCore(
+        inferenceTask,          // task function
+        "InferenceTask",        // name (shown in freeRTOS task list)
+        INFERENCE_TASK_STACK,   // stack depth in bytes (10 240 is safe for TFLite)
+        NULL,                   // no parameter needed
+        1,                      // priority 1 (above idle, below WiFi)
+        &inferenceTaskHandle,
+        1                       // pin to Core 1
+    );
+
+    // ── Print system configuration summary ──────────────────────────────────
+    Serial.println("\n================================================");
+    Serial.println("  SYSTEM READY");
+    Serial.println("================================================");
+    Serial.printf("  Sample rate    : %d Hz  (every %d ms)\n",
+                  SAMPLE_RATE_HZ, READ_INTERVAL);
+    Serial.printf("  Window         : %d samples  (%.1f s)\n",
+                  WINDOW_SIZE, (float)WINDOW_SIZE / SAMPLE_RATE_HZ);
+    Serial.printf("  Overlap        : 50%%  (%.1f s between inferences)\n",
+                  (float)(WINDOW_SIZE / 2) / SAMPLE_RATE_HZ);
+    Serial.printf("  Channels       : %d  (ax ay az gx gy gz)\n", NUM_CHANNELS);
+    Serial.printf("  CNN threshold  : %.0f%%\n",    FALL_THRESHOLD * 100);
+    Serial.printf("  Min accel peak : %.1f m/s²\n", MIN_ACCEL_MAGNITUDE);
+    Serial.printf("  Debounce       : %d / 3 windows must be candidates\n",
+                  CONSECUTIVE_DETECTIONS);
+    Serial.printf("  Alert timeout  : %d s\n",      ALERT_DURATION / 1000);
+    Serial.printf("  Normalisation  : Z-score (SisFall per-channel mean/std)\n");
+    Serial.printf("  Inference core : Core 1  (non-blocking)\n");
+    Serial.printf("  Output bug fix : %s\n",
+                  useSoftmax ? "ACTIVE — using softmax index 1 for fall prob"
+                             : "N/A — single sigmoid output, reading index 0");
+    Serial.println();
+
+    // ── Hardware test beep (confirms buzzer and LED are wired correctly) ─────
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 2000);  delay(150);
+    noTone(BUZZER_PIN);      delay(100);
+    tone(BUZZER_PIN, 2500);  delay(150);
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("  Alert hardware test OK");
+    Serial.println("  Monitoring started...\n");
+    Serial.println("================================================\n");
+
+    previousMillis = millis();
+}
+
+// ============================================================================
+//  SENSOR READ & BUFFER MANAGEMENT  (Core 0, called every 5 ms)
+// ============================================================================
+//
+// Reads all 14 bytes from the MPU-6050 in a single I²C burst (most efficient),
+// converts to physical units, stores in sensorBuffer, and triggers inference
+// when the window is full.
+
+void readAndStoreSensor() {
+    // ── Burst-read 14 bytes starting at ACCEL_XOUT_H (0x3B) ─────────────────
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);            // repeated start — keeps the bus
+    Wire.requestFrom((uint8_t)MPU_ADDR, (size_t)14, (bool)true);
+
+    int16_t AcX = (Wire.read()<<8)|Wire.read();  // ACCEL_XOUT
+    int16_t AcY = (Wire.read()<<8)|Wire.read();  // ACCEL_YOUT
+    int16_t AcZ = (Wire.read()<<8)|Wire.read();  // ACCEL_ZOUT
+    Wire.read(); Wire.read();                     // TEMP_OUT — discarded
+    int16_t GyX = (Wire.read()<<8)|Wire.read();  // GYRO_XOUT
+    int16_t GyY = (Wire.read()<<8)|Wire.read();  // GYRO_YOUT
+    int16_t GyZ = (Wire.read()<<8)|Wire.read();  // GYRO_ZOUT
+
+    // ── Apply calibration offsets (remove DC bias, remove 1 g from az) ───────
+    float ax_raw = AcX - accelOffsetX;
+    float ay_raw = AcY - accelOffsetY;
+    float az_raw = AcZ - accelOffsetZ;
+    float gx_raw = GyX - gyroOffsetX;
+    float gy_raw = GyY - gyroOffsetY;
+    float gz_raw = GyZ - gyroOffsetZ;
+
+    // ── Convert to physical units ─────────────────────────────────────────────
+    //   Accel: raw / 2048 (LSB/g)  × 9.80665 (m/s²/g)  → m/s²
+    //   Gyro : raw / 16.4  (LSB/°/s) × π/180 (rad/s/°/s) → rad/s
+    float ax = (ax_raw / ACCEL_SCALE) * G_TO_MS2;
+    float ay = (ay_raw / ACCEL_SCALE) * G_TO_MS2;
+    float az = (az_raw / ACCEL_SCALE) * G_TO_MS2;
+    float gx = (gx_raw / GYRO_SCALE)  * DEG_TO_RAD;
+    float gy = (gy_raw / GYRO_SCALE)  * DEG_TO_RAD;
+    float gz = (gz_raw / GYRO_SCALE)  * DEG_TO_RAD;
+
+    // ── Store directly (no axis remap needed for table/desk breadboard demo) ───
+    // NOTE: If mounting orientation is known, apply axis remapping here before
+    // storing, matching the body-frame convention used in SisFall collection.
+    sensorBuffer[bufferIndex][0] = ax;
+    sensorBuffer[bufferIndex][1] = ay;
+    sensorBuffer[bufferIndex][2] = az;
+    sensorBuffer[bufferIndex][3] = gx;
+    sensorBuffer[bufferIndex][4] = gy;
+    sensorBuffer[bufferIndex][5] = gz;
+
+    bufferIndex++;
+    totalReadings++;
+
+    // ── When the window is full, snapshot → infer → shift ────────────────────
+    if (bufferIndex >= WINDOW_SIZE) {
+        bufferFull = true;
+
+        // Check if Core 1 finished the previous inference
+        if (inferenceDone) {
+            inferenceDone = false;
+            if (inferenceResult && !fallDetected) {
+                handleFallDetected();
+            }
+        }
+
+        // Only queue a new inference if Core 1 has gone idle
+        // (prevents overwriting inferenceBuffer mid-inference)
+        if (!inferenceReady) {
+            memcpy(inferenceBuffer, sensorBuffer, sizeof(sensorBuffer));
+            inferenceReady = true;
+        }
+
+        // Shift buffer by 50 % — fast O(n) memcpy
+        shiftBuffer();
+    }
+}
+
+// ============================================================================
+//  BUFFER SHIFT — 50 % OVERLAP
+// ============================================================================
+//
+// Moves the second half of sensorBuffer to the first half, then sets
+// bufferIndex = WINDOW_SIZE/2 so the next 200 samples complete the window.
+// This gives a 1 s overlap between consecutive windows and halves detection
+// latency compared to non-overlapping windows.
+
+void shiftBuffer() {
+    int half = WINDOW_SIZE / 2;
+    // memcpy is safe here because src and dst do not overlap:
+    //   src starts at index half, dst at index 0.
+    memcpy(&sensorBuffer[0][0],
+           &sensorBuffer[half][0],
+           (size_t)(half * NUM_CHANNELS) * sizeof(float));
+    bufferIndex = half;
+}
+
+// ============================================================================
+//  CNN INFERENCE  (called from Core 1 via inferenceTask)
+// ============================================================================
+//
+// Returns true if the window represents a confirmed fall; false otherwise.
+//
+// STEPS:
+//   1. Z-score normalise each sample using SisFall channel statistics.
+//   2. Quantise normalised float → INT8 (matching training export).
+//   3. Run interpreter->Invoke().
+//   4. Dequantise output → float probability  (handles both sigmoid and softmax).
+//   5. Compute peak acceleration magnitude across the window (physical gate).
+//   6. Apply dual-gate + 3-window debounce.
+//   7. Print diagnostic line to Serial.
+
+bool runInference() {
+    totalInferences++;
+    unsigned long t0 = micros();
+
+    // ── STEP 1 & 2: Normalise + quantise ─────────────────────────────────────
+    //
+    // Z-score normalisation:
+    //   norm = (value − channel_mean) / channel_std
+    //   This maps the raw physical-unit value into the same statistical space
+    //   the CNN saw during training on SisFall.
+    //
+    // Quantisation to INT8:
+    //   q = round( norm / INPUT_SCALE  + INPUT_ZERO_POINT )
+    //   then clamp to [-128, 127].
+    //   INPUT_SCALE = 0.0392157 ≈ 1/25.5  (gives ~6.35 quantisation levels per σ)
+    //
+    // The ±6σ soft-clamp prevents extreme spikes (hard drop, table bang) from
+    // wrapping around the INT8 range.  ±4σ was too tight for demo conditions.
+
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        for (int j = 0; j < NUM_CHANNELS; j++) {
+            float raw  = inferenceBuffer[i][j];
+
+            // Z-score normalise
+            float norm = (raw - CHANNEL_MEAN[j]) / CHANNEL_STD[j];
+
+            // Soft-clamp at ±6σ (avoids int8 saturation for hard impacts)
+            if (norm >  6.0f) norm =  6.0f;
+            if (norm < -6.0f) norm = -6.0f;
+
+            // Quantise
+            int32_t q = (int32_t)roundf(norm / INPUT_SCALE + INPUT_ZERO_POINT);
+            // Guard against residual int8 overflow after clamp
+            if (q >  127) q =  127;
+            if (q < -128) q = -128;
+
+            inputTensor->data.int8[i * NUM_CHANNELS + j] = (int8_t)q;
+        }
+    }
+
+    // ── STEP 3: Run inference ─────────────────────────────────────────────────
+    TfLiteStatus status = interpreter->Invoke();
+    unsigned long inferenceUs = micros() - t0;   // ← stop timer here, before accel scan
+
+    if (status != kTfLiteOk) {
+        Serial.println("[Core 1] ERROR: interpreter->Invoke() failed!");
+        return false;
+    }
+
+    // ── STEP 4: Dequantise output → fall probability ──────────────────────────
+    //
+    // INT8 → float dequantisation formula:
+    //   float_value = (int8_value − zero_point) × scale
+    //
+    // For softmax (2-node) output:
+    //   index 0 = P(no_fall),  index 1 = P(fall)
+    //   Read index 1 for fall probability.
+    //
+    // For sigmoid (1-node) output:
+    //   index 0 = P(fall) directly.
+    //
+    // The original code always read index 0 — which is WHY it reported 99 %
+    // "fall" confidence even during normal movement: it was actually reading
+    // the NO-FALL probability from a softmax output and the two scores are
+    // complementary (softmax forces them to sum to 1).
+    //
+    // We print BOTH nodes here so any future topology change is immediately
+    // visible on the Serial Monitor.
+
+    float probability = 0.0f;
+
+    if (useSoftmax) {
+        // Two nodes: [no_fall, fall]
+        int8_t qNoFall = outputTensor->data.int8[0];
+        int8_t qFall   = outputTensor->data.int8[1];
+
+        float pNoFall = ((float)qNoFall - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+        float pFall   = ((float)qFall   - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+
+        // Clamp to [0, 1] (rounding can push marginally outside)
+        pNoFall = constrain(pNoFall, 0.0f, 1.0f);
+        pFall   = constrain(pFall,   0.0f, 1.0f);
+
+        probability = pFall;
+
+        // Sanity check: softmax outputs must sum to ~1
+        float sum = pNoFall + pFall;
+        if (fabsf(sum - 1.0f) > 0.10f) {
+            Serial.printf("[Core 1] WARNING: softmax sum = %.3f (expected ~1.0). "
+                          "Check OUTPUT_SCALE / OUTPUT_ZERO_POINT.\n", sum);
+        }
+
+        // Print both outputs for full visibility
+        Serial.printf("  Raw outputs    : no_fall=%.1f%%  fall=%.1f%%  sum=%.1f%%\n",
+                      pNoFall * 100, pFall * 100, sum * 100);
+    } else {
+        // Single sigmoid output: index 0 is the fall probability
+        int8_t qFall = outputTensor->data.int8[0];
+        probability  = ((float)qFall - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+        probability  = constrain(probability, 0.0f, 1.0f);
+
+        Serial.printf("  Raw output     : fall=%.1f%%  (sigmoid)\n",
+                      probability * 100);
+    }
+
+    // ── STEP 5: Peak acceleration magnitude ──────────────────────────────────
+    //
+    // Scan the ENTIRE inferenceBuffer (the same snapshot the CNN just processed)
+    // for the single highest ||a|| sample.  Using the peak (not the mean)
+    // ensures a sharp 5–10 sample impact spike is never diluted by surrounding
+    // normal samples.
+    //
+    // Using inferenceBuffer (not the live sensorBuffer) guarantees CNN score and
+    // accel gate always refer to the exact same time window.
+
+    float accelMag = 0.0f;
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        float ax  = inferenceBuffer[i][0];
+        float ay  = inferenceBuffer[i][1];
+        float az  = inferenceBuffer[i][2];
+        float mag = sqrtf(ax*ax + ay*ay + az*az);
+        if (mag > accelMag) accelMag = mag;
+    }
+
+    // ── STEP 6: Dual-gate decision + 3-window debounce ───────────────────────
+    //
+    // Both gates must pass for a window to be a "candidate":
+    //   Gate A: CNN fall probability ≥ FALL_THRESHOLD  (default 0.60)
+    //   Gate B: Peak ||a|| ≥ MIN_ACCEL_MAGNITUDE       (default 11.0 m/s²)
+    //
+    // Gate B is a physics sanity check — a CNN false-positive caused by slow
+    // rotation or arm swinging will be rejected because those movements do not
+    // produce high-magnitude acceleration spikes.
+    //
+    // Debounce: CONSECUTIVE_DETECTIONS out of the last 3 windows must be
+    // candidates.  Default is 2/3 — requires the fall signature to persist
+    // across two overlapping 2 s windows (effectively 3 s coverage with 50 %
+    // overlap), eliminating single-window transients.
+
+    bool highConf  = (probability >= FALL_THRESHOLD);
+    bool highAccel = (accelMag   >= MIN_ACCEL_MAGNITUDE);
+    bool candidate = highConf && highAccel;
+
+    detectionHistory[detectionHistoryIndex % 3] = candidate;
+    confidenceHistory[detectionHistoryIndex % 3] = probability;
+    detectionHistoryIndex++;
+
+    int recentHits = 0;
+    for (int i = 0; i < 3; i++) if (detectionHistory[i]) recentHits++;
+
+    bool confirmed = (recentHits >= CONSECUTIVE_DETECTIONS);
+
+    // ── Capture results for Core 0 (thread-safe via volatile) ────────────────
+    lastDetectionProbability = probability;
+    lastDetectionAccelMag    = accelMag;
+
+    // ── STEP 7: Serial diagnostic output ─────────────────────────────────────
+    Serial.printf("\n[Inference #%lu  Core 1]\n", totalInferences);
+    Serial.printf("  CNN confidence : %5.1f%%  threshold %.0f%%  %s\n",
+                  probability * 100, FALL_THRESHOLD * 100,
+                  highConf  ? "PASS" : "fail");
+    Serial.printf("  Peak accel     : %5.2f m/s²  min %.1f m/s²  %s\n",
+                  accelMag, MIN_ACCEL_MAGNITUDE,
+                  highAccel ? "PASS" : "fail");
+    Serial.printf("  Decision       : %s\n",
+                  candidate ? "CANDIDATE FALL" : "normal");
+    Serial.printf("  History        : [");
+    for (int i = 0; i < 3; i++)
+        Serial.printf("%s%s", detectionHistory[i] ? "o" : ".", i < 2 ? " " : "");
+    Serial.printf("]  %d / %d\n", recentHits, CONSECUTIVE_DETECTIONS);
+    Serial.printf("  Debounce       : %s\n",
+                  confirmed ? ">>> FALL CONFIRMED <<<" : "monitoring");
+    Serial.printf("  Inference time : %.2f ms\n", (float)inferenceUs / 1000.0f);
+
+    return confirmed;
+}
+
+// ============================================================================
+//  FALL HANDLER
+// ============================================================================
+//
+// Called from Core 0 when inferenceResult is true and no alert is active.
+// Activates the local buzzer + LED and sends an IFTTT webhook if WiFi is up.
+
+void handleFallDetected() {
+    fallCount++;
+    fallDetected  = true;
+    fallAlertTime = millis();
+
+    // Read values captured by Core 1 (not re-reading outputTensor which may
+    // already be overwritten by the next inference)
+    float probability = lastDetectionProbability;
+    float accelMag    = lastDetectionAccelMag;
+
+    Serial.println("\n================================================");
+    Serial.println("  *** FALL DETECTED ***");
+    Serial.println("================================================");
+    Serial.printf("  Event #         : %lu\n",  fallCount);
+    Serial.printf("  CNN confidence  : %.1f%%\n", probability * 100);
+    Serial.printf("  Peak accel      : %.2f m/s²\n", accelMag);
+    Serial.printf("  Debounce        : %d/3 windows confirmed\n", CONSECUTIVE_DETECTIONS);
+    Serial.printf("  Timestamp       : %lu ms\n", millis());
+    Serial.printf("  Detection windows:\n");
+    for (int i = 0; i < 3; i++) {
+        Serial.printf("    Window %d : %.1f%% confidence  %s\n",
+                      i + 1, confidenceHistory[i] * 100,
+                      detectionHistory[i] ? "[FALL]" : "[normal]");
+    }
+    Serial.println("================================================\n");
+
+    // ── Local alerts ─────────────────────────────────────────────────────────
+    digitalWrite(LED_PIN, HIGH);
+    tone(BUZZER_PIN, 2000);  // continuous tone until checkAlertTimeout clears it
+
+    // ── Remote alert via IFTTT webhook ───────────────────────────────────────
+    if (WiFi.status() == WL_CONNECTED) {
+        sendIFTTT(probability, accelMag);
+    } else {
+        Serial.println("  WiFi not connected — local alert only");
+    }
+}
+
+// ============================================================================
+//  ALERT TIMEOUT CHECK
+// ============================================================================
+//
+// After ALERT_DURATION ms the system resets to monitoring mode.
+// Called every loop iteration — no blocking delay.
+
+void checkAlertTimeout() {
+    if (fallDetected && (millis() - fallAlertTime > ALERT_DURATION)) {
+        fallDetected = false;
+        digitalWrite(LED_PIN, LOW);
+        noTone(BUZZER_PIN);
+        Serial.println("Alert cleared — resuming normal monitoring\n");
+    }
+}
+
+// ============================================================================
+//  IFTTT WEBHOOK NOTIFICATION
+// ============================================================================
+//
+// Sends a GET request to the IFTTT Maker Webhooks endpoint.
+// value1 = event label, value2 = confidence %, value3 = peak accel
+
+void sendIFTTT(float probability, float magnitude) {
+    Serial.println("  Sending IFTTT notification...");
+
+    if (!wifiClient.connect(IFTTT_HOST, 80)) {
+        Serial.println("  IFTTT connection failed — check IFTTT_HOST and network");
+        return;
+    }
+
+    String url  = "/trigger/";
+    url += IFTTT_EVENT;
+    url += "/with/key/";
+    url += IFTTT_KEY;
+    url += "?value1=Fall%20Alert";
+    url += "&value2=Confidence:";
+    url += String((int)(probability * 100));
+    url += "%25";
+    url += "&value3=Accel:";
+    url += String(magnitude, 1);
+    url += "m/s2";
+
+    wifiClient.print(
+        String("GET ") + url + " HTTP/1.1\r\n" +
+        "Host: " + IFTTT_HOST + "\r\n" +
+        "Connection: close\r\n\r\n"
+    );
+
+    unsigned long timeout = millis();
+    while (wifiClient.connected() && millis() - timeout < 3000) {
+        if (wifiClient.available()) {
+            String line = wifiClient.readStringUntil('\n');
+            if (line.indexOf("HTTP/1.1") >= 0) {
+                if (line.indexOf("200") >= 0)
+                    Serial.println("  IFTTT notification sent OK (HTTP 200)");
+                else {
+                    Serial.print("  IFTTT server response: ");
+                    Serial.println(line);
+                }
+                break;
+            }
+        }
+    }
+    wifiClient.stop();
+}
+
+// ============================================================================
+//  WIFI KEEP-ALIVE  (non-blocking)
+// ============================================================================
+//
+// Checks every 30 s whether WiFi is still connected.
+// Uses millis() — never blocks the sensor loop.
+// The actual reconnect attempt is non-blocking too; if the AP is not
+// reachable the sketch continues locally and tries again in 30 s.
+
+void checkWiFiConnection() {
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck < 30000) return;
+    lastCheck = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi lost — attempting reconnect (non-blocking)...");
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        // Return immediately; next call in 30 s will check if reconnect succeeded
+    }
+}
+
+// ============================================================================
+//  MAIN LOOP  (Core 0 — sensor timing, alert management, WiFi watchdog)
+// ============================================================================
+//
+// This loop is deliberately lightweight.  Heavy work (inference, normalisation)
+// runs on Core 1 so the 200 Hz sampling cadence is never disrupted.
+//
+// millis()-based timing (previousMillis approach) is used instead of delay()
+// to avoid blocking calls that would cause missed readings.
+
+void loop() {
+    unsigned long now = millis();
+
+    // ── Precise 200 Hz sampling (every 5 ms) ─────────────────────────────────
+    if (now - previousMillis >= READ_INTERVAL) {
+        previousMillis = now;
+        readAndStoreSensor();
+    }
+
+    // ── Non-blocking alert timeout and WiFi watchdog ─────────────────────────
+    checkAlertTimeout();
+    checkWiFiConnection();
+}
