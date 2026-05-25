@@ -621,12 +621,6 @@ bool runInference() {
     //
     // For sigmoid (1-node) output:
     //   index 0 = P(fall) directly.
-    //
-    // The original code always read index 0 — which is WHY it reported 99 %
-    // "fall" confidence even during normal movement: it was actually reading
-    // the NO-FALL probability from a softmax output and the two scores are
-    // complementary (softmax forces them to sum to 1).
-    //
     // We print BOTH nodes here so any future topology change is immediately
     // visible on the Serial Monitor.
 
